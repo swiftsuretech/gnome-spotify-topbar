@@ -15,12 +15,9 @@ cp "$REPO_DIR/bin/spotify-topbar-settings" "$BIN_DIR/spotify-topbar-settings"
 chmod +x "$BIN_DIR/spotify-connect-ctl" "$BIN_DIR/spotify-topbar-settings"
 
 if [ ! -d "$MC_DIR" ]; then
-    echo "==> Installing base Media Controls extension ($MC_UUID v2.4.4)..."
+    echo "==> Installing bundled Media Controls extension ($MC_UUID v2.4.4)..."
     mkdir -p "$MC_DIR"
-    TMP_ZIP="$(mktemp --suffix=.zip)"
-    curl -fsSL "https://github.com/sakithb/media-controls/releases/download/v2.4.4/$MC_UUID.shell-extension.zip" -o "$TMP_ZIP"
-    unzip -qo "$TMP_ZIP" -d "$MC_DIR"
-    rm -f "$TMP_ZIP"
+    cp -r "$REPO_DIR/vendor/$MC_UUID/"* "$MC_DIR/"
     if [ -d "$MC_DIR/schemas" ]; then
         glib-compile-schemas "$MC_DIR/schemas"
     fi

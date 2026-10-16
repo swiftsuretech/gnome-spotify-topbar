@@ -6,19 +6,29 @@ const { Gio, GLib, Gtk, Adw } = imports.gi;
 
 const CTL_PATH = GLib.build_filenamev([GLib.get_home_dir(), '.local', 'bin', 'spotify-connect-ctl']);
 
-function runCtlSync(args) {
+function runCtlAsync(args, onDone) {
     try {
-        const [ok, stdout, stderr, status] = GLib.spawn_command_line_sync(
-            [CTL_PATH, ...args].map(a => GLib.shell_quote(a)).join(' ')
+        const proc = Gio.Subprocess.new(
+            [CTL_PATH, ...args],
+            Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE
         );
-        if (!ok || status !== 0) {
-            const errStr = imports.byteArray.toString(stderr || []);
-            return { error: errStr || `Exit ${status}` };
-        }
-        const outStr = imports.byteArray.toString(stdout || []).trim();
-        return outStr ? JSON.parse(outStr) : {};
+        proc.communicate_utf8_async(null, null, (source, res) => {
+            let parsed = {};
+            try {
+                const [, stdout, stderr] = source.communicate_utf8_finish(res);
+                const outStr = (stdout || '').trim();
+                if (outStr) {
+                    parsed = JSON.parse(outStr);
+                } else if (stderr) {
+                    parsed = { error: stderr.trim() };
+                }
+            } catch (e) {
+                parsed = { error: e.message || String(e) };
+            }
+            if (onDone) onDone(parsed);
+        });
     } catch (e) {
-        return { error: e.message || String(e) };
+        if (onDone) onDone({ error: e.message || String(e) });
     }
 }
 
@@ -39,7 +49,6 @@ app.connect('activate', () => {
     const page = new Adw.PreferencesPage();
     win.add(page);
 
-    // 1. Account & Bridge Group
     const accountGroup = new Adw.PreferencesGroup({
         title: 'Spotify Account & Local Bridge',
         description: 'This extension reuses your local Spotify Desktop session over its CEF bridge (no separate API keys required).',
@@ -75,7 +84,6 @@ app.connect('activate', () => {
     bridgeRow.add_suffix(setupBridgeBtn);
     accountGroup.add(bridgeRow);
 
-    // 2. Speaker Toggle Target Group
     const speakerGroup = new Adw.PreferencesGroup({
         title: 'Top-Bar Speaker Toggle',
         description: 'Choose which Spotify Connect speaker the top-bar pill switches between (Speaker ↔ PC).',
@@ -110,7 +118,6 @@ app.connect('activate', () => {
     devicesRow.add_suffix(devicesBox);
     speakerGroup.add(devicesRow);
 
-    // 3. UI & Behaviour Group
     const uiGroup = new Adw.PreferencesGroup({
         title: 'Popup & Background Behaviour',
     });
@@ -143,7 +150,7 @@ app.connect('activate', () => {
             headlessMode: headlessSwitchRow.get_active(),
             bridgePort: parseInt(portEntryRow.get_text() || '9229', 10) || 9229,
         };
-        runCtlSync(['set-config', JSON.stringify(payload)]);
+        runCtlAsync(['set-config', JSON.stringify(payload)], null);
     }
 
     function refreshDevicesList() {
@@ -153,63 +160,73 @@ app.connect('activate', () => {
             devicesBox.remove(child);
             child = next;
         }
-        const st = runCtlSync(['discover']);
-        const devs = (st.devices || []).filter(d => !d.isLocal);
-        if (devs.length === 0) {
-            const lbl = new Gtk.Label({
-                label: st.error ? 'Bridge offline' : 'No external speakers found',
-            });
-            devicesBox.append(lbl);
-            return;
-        }
-        for (const d of devs) {
-            const btn = new Gtk.Button({
-                label: d.name,
-                valign: Gtk.Align.CENTER,
-            });
-            btn.connect('clicked', () => {
-                speakerEntryRow.set_text(d.name);
-                saveCurrentSettings();
-            });
-            devicesBox.append(btn);
-        }
+        const scanningLbl = new Gtk.Label({ label: 'Scanning…' });
+        devicesBox.append(scanningLbl);
+
+        runCtlAsync(['discover'], (st) => {
+            let ch = devicesBox.get_first_child();
+            while (ch) {
+                const nxt = ch.get_next_sibling();
+                devicesBox.remove(ch);
+                ch = nxt;
+            }
+            const devs = ((st && st.devices) || []).filter(d => !d.isLocal);
+            if (devs.length === 0) {
+                const lbl = new Gtk.Label({
+                    label: st && st.error ? 'Bridge offline' : 'No external speakers found',
+                });
+                devicesBox.append(lbl);
+                return;
+            }
+            for (const d of devs) {
+                const btn = new Gtk.Button({
+                    label: d.name,
+                    valign: Gtk.Align.CENTER,
+                });
+                btn.connect('clicked', () => {
+                    speakerEntryRow.set_text(d.name);
+                    saveCurrentSettings();
+                });
+                devicesBox.append(btn);
+            }
+        });
     }
 
     function refreshState() {
-        isRefreshing = true;
-        const info = runCtlSync(['get-config']);
-        const cfg = info.config || {};
-        const accounts = info.userAccounts || [];
-        const acctStr = info.loggedIn
-            ? `Signed in (${accounts.join(', ')})`
-            : 'Not signed in — click "Open Spotify / Sign In" below';
-        const bridgeStr = info.bridgeConnected
-            ? `Bridge connected (${info.installType || 'local'})`
-            : `Bridge disconnected (${info.installType || 'local'})`;
-        statusRow.set_subtitle(`${acctStr}  •  ${bridgeStr}`);
+        runCtlAsync(['get-config'], (info) => {
+            isRefreshing = true;
+            const cfg = (info && info.config) || {};
+            const accounts = (info && info.userAccounts) || [];
+            const acctStr = info && info.loggedIn
+                ? `Signed in (${accounts.join(', ')})`
+                : 'Not signed in — click "Open Spotify / Sign In" below';
+            const bridgeStr = info && info.bridgeConnected
+                ? `Bridge connected (${info.installType || 'local'})`
+                : `Bridge disconnected (${(info && info.installType) || 'local'})`;
+            statusRow.set_subtitle(`${acctStr}  •  ${bridgeStr}`);
 
-        speakerEntryRow.set_text(cfg.preferredSpeaker || '');
-        wikiSwitchRow.set_active(cfg.showWikipedia !== false);
-        headlessSwitchRow.set_active(cfg.headlessMode !== false);
-        portEntryRow.set_text(String(cfg.bridgePort || 9229));
-        isRefreshing = false;
+            speakerEntryRow.set_text(cfg.preferredSpeaker || '');
+            wikiSwitchRow.set_active(cfg.showWikipedia !== false);
+            headlessSwitchRow.set_active(cfg.headlessMode !== false);
+            portEntryRow.set_text(String(cfg.bridgePort || 9229));
+            isRefreshing = false;
+        });
     }
 
     openSpotifyBtn.connect('clicked', () => {
-        runCtlSync(['open-login']);
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
-            refreshState();
-            return GLib.SOURCE_REMOVE;
+        runCtlAsync(['open-login'], () => {
+            GLib.timeout_add(GLib.PRIORITY_DEFAULT, 1500, () => {
+                refreshState();
+                return GLib.SOURCE_REMOVE;
+            });
         });
     });
 
     setupBridgeBtn.connect('clicked', () => {
         statusRow.set_subtitle('Configuring Spotify prefs and starting bridge…');
-        GLib.timeout_add(GLib.PRIORITY_DEFAULT, 100, () => {
-            runCtlSync(['setup-bridge']);
+        runCtlAsync(['setup-bridge'], () => {
             refreshState();
             refreshDevicesList();
-            return GLib.SOURCE_REMOVE;
         });
     });
 

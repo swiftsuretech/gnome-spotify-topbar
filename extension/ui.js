@@ -308,7 +308,17 @@ export class SpotifySpeakerController {
                 style: `width: ${STANDARD_MENU_WIDTH}px; min-width: ${STANDARD_MENU_WIDTH}px; max-width: ${STANDARD_MENU_WIDTH}px; spacing: 6px; margin-top: 4px; margin-bottom: 2px;`,
             });
 
-            const infoGIcon = Gio.FileIcon.new(Gio.File.new_for_path(INFO_ICON_PATH));
+            const hasYaruInfoIcon = GLib.file_test(INFO_ICON_PATH, GLib.FileTest.EXISTS);
+            const infoGIcon = hasYaruInfoIcon
+                ? Gio.FileIcon.new(Gio.File.new_for_path(INFO_ICON_PATH))
+                : null;
+            const createInfoIconActor = () => new St.Icon({
+                ...(infoGIcon ? { gicon: infoGIcon } : { icon_name: 'dialog-information-symbolic' }),
+                icon_size: 15,
+                style_class: 'symbolic-icon',
+                y_align: Clutter.ActorAlign.CENTER,
+                style: '-st-icon-style: symbolic; color: rgba(255, 255, 255, 0.20);',
+            });
 
             // 1. Left-aligned Track Title row (wraps across 2 lines without clipping)
             this._titleLabel = new St.Label({
@@ -371,13 +381,7 @@ export class SpotifySpeakerController {
                 y_align: Clutter.ActorAlign.CENTER,
                 style: 'padding: 1px 2px;',
             });
-            this._artistWikiIcon = new St.Icon({
-                gicon: infoGIcon,
-                icon_size: 15,
-                style_class: 'symbolic-icon',
-                y_align: Clutter.ActorAlign.CENTER,
-                style: '-st-icon-style: symbolic; color: rgba(255, 255, 255, 0.22);',
-            });
+            this._artistWikiIcon = createInfoIconActor();
             this._artistWikiBtn.add_child(this._artistWikiIcon);
             this._artistWikiBtn.connect('notify::hover', () => {
                 this._updateWikiIconStyles();
@@ -439,13 +443,7 @@ export class SpotifySpeakerController {
                 y_align: Clutter.ActorAlign.CENTER,
                 style: 'padding: 1px 2px;',
             });
-            this._albumWikiIcon = new St.Icon({
-                gicon: infoGIcon,
-                icon_size: 15,
-                style_class: 'symbolic-icon',
-                y_align: Clutter.ActorAlign.CENTER,
-                style: '-st-icon-style: symbolic; color: rgba(255, 255, 255, 0.22);',
-            });
+            this._albumWikiIcon = createInfoIconActor();
             this._albumWikiBtn.add_child(this._albumWikiIcon);
             this._albumWikiBtn.connect('notify::hover', () => {
                 this._updateWikiIconStyles();

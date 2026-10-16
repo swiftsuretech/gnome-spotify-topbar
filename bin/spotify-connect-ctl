@@ -141,7 +141,7 @@ X11.XCloseDisplay(dpy)`,
     "sh",
     [
       "-c",
-      `nohup ${info.launchCmd} --remote-debugging-port=${BRIDGE_PORT} --remote-allow-origins=* >/dev/null 2>&1 &`,
+      `nohup ${info.launchCmd} --remote-debugging-port=${BRIDGE_PORT} --remote-allow-origins=http://127.0.0.1:${BRIDGE_PORT} >/dev/null 2>&1 &`,
     ],
     { detached: true, stdio: "ignore" }
   ).unref();
@@ -156,7 +156,7 @@ async function getPages() {
 async function ensureBridge() {
   try {
     const pages = await getPages();
-    const xpui = pages.find((p) => p.url && p.url.includes("xpui.app.spotify.com")) || pages[0];
+    const xpui = pages.find((p) => p.url && p.url.includes("xpui.app.spotify.com"));
     if (xpui && xpui.webSocketDebuggerUrl) return xpui.webSocketDebuggerUrl;
   } catch (_) {
     // Port 9229 not listening; relaunch Spotify with remote debugging
@@ -170,7 +170,7 @@ async function ensureBridge() {
     "sh",
     [
       "-c",
-      `gdbus call --session --dest org.mpris.MediaPlayer2.spotify --object-path /org/mpris/MediaPlayer2 --method org.mpris.MediaPlayer2.Quit >/dev/null 2>&1 || killall spotify >/dev/null 2>&1 || true; sleep 1.2; nohup ${info.launchCmd} ${minFlag} --remote-debugging-port=${BRIDGE_PORT} --remote-allow-origins=* >/dev/null 2>&1 &`,
+      `gdbus call --session --dest org.mpris.MediaPlayer2.spotify --object-path /org/mpris/MediaPlayer2 --method org.mpris.MediaPlayer2.Quit >/dev/null 2>&1 || killall spotify >/dev/null 2>&1 || true; sleep 1.2; nohup ${info.launchCmd} ${minFlag} --remote-debugging-port=${BRIDGE_PORT} --remote-allow-origins=http://127.0.0.1:${BRIDGE_PORT} >/dev/null 2>&1 &`,
     ],
     { detached: true, stdio: "ignore" }
   ).unref();
@@ -179,7 +179,7 @@ async function ensureBridge() {
     await new Promise((r) => setTimeout(r, 500));
     try {
       const pages = await getPages();
-      const xpui = pages.find((p) => p.url && p.url.includes("xpui.app.spotify.com")) || pages[0];
+      const xpui = pages.find((p) => p.url && p.url.includes("xpui.app.spotify.com"));
       if (xpui && xpui.webSocketDebuggerUrl) {
         if (USER_CONFIG.headlessMode !== false) {
           // Hide the newly spawned Spotify window into background tray mode
@@ -227,7 +227,9 @@ function evalInSpotify(wsUrl, expression) {
     const timer = setTimeout(() => {
       reject(new Error("Timed out talking to Spotify CEF bridge"));
     }, 5000);
-    const ws = new WebSocket(wsUrl);
+    const ws = new WebSocket(wsUrl, {
+      headers: { Origin: `http://127.0.0.1:${BRIDGE_PORT}` },
+    });
     ws.onopen = () => {
       ws.send(
         JSON.stringify({
@@ -636,12 +638,12 @@ function buildSpotifyExpression(cmd, arg) {
       let target = null;
       const matchDevice = (list, pat) => {
         if (pat) {
-          return list.find(d => d.name.toLowerCase().includes(pat) || d.id.toLowerCase().includes(pat));
+          return list.find(d => (d.name || '').toLowerCase().includes(pat) || (d.id || '').toLowerCase().includes(pat));
         }
         return list.find(d => !d.isLocal);
       };
       if (cmd === 'toggle') {
-        if (active && !active.isLocal && (!pattern || active.name.toLowerCase().includes(pattern))) {
+        if (active && !active.isLocal && (!pattern || (active.name || '').toLowerCase().includes(pattern))) {
           target = devices.find(d => d.isLocal) || { id: 'local_device', name: 'desktop', isLocal: true };
         } else {
           target = matchDevice(devices, pattern);
@@ -660,7 +662,7 @@ function buildSpotifyExpression(cmd, arg) {
         if (pattern === 'local' || pattern === 'local_device' || pattern === 'desktop' || pattern === 'pc') {
           target = devices.find(d => d.isLocal) || { id: 'local_device', name: 'desktop', isLocal: true };
         } else {
-          target = devices.find(d => d.id === arg || d.connectStateId === arg || d.name.toLowerCase().includes(pattern));
+          target = devices.find(d => d.id === arg || d.connectStateId === arg || (d.name || '').toLowerCase().includes(pattern));
         }
       }
 
