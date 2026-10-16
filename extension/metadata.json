@@ -1,0 +1,8 @@
+{
+  "uuid": "spotify-search@davewhitehouse",
+  "name": "Spotify Top-Bar Controller, Knob & Connect Switcher",
+  "description": "Analogue rotary volume knob, one-click Spotify Connect speaker toggle, Song Radio & Album browser, and verified Wikipedia links for GNOME Shell.",
+  "shell-version": ["45", "46", "47"],
+  "version": 1,
+  "url": "https://github.com/swiftsuretech/gnome-spotify-topbar"
+}

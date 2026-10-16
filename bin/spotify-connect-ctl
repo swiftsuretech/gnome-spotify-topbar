@@ -1,0 +1,869 @@
+#!/usr/bin/env node
+/**
+ * Control Spotify Connect playback target (Polk React <-> Desktop, or any Connect device)
+ * via the local Spotify CEF DevTools bridge on 127.0.0.1:9229.
+ *
+ * Usage:
+ *   spotify-connect-ctl status            # JSON status of active + available devices
+ *   spotify-connect-ctl toggle [target]   # Toggle between Polk React (default) and local_device
+ *   spotify-connect-ctl select <name|id>  # Switch to a specific device by name/substring or id
+ */
+
+const { spawn, execFileSync } = require("node:child_process");
+const fs = require("node:fs");
+const os = require("node:os");
+const path = require("node:path");
+
+const CONFIG_DIR = path.join(os.homedir(), ".config", "spotify-topbar");
+const CONFIG_PATH = path.join(CONFIG_DIR, "config.json");
+
+function loadConfig() {
+  const defaults = {
+    preferredSpeaker: "",
+    bridgePort: 9229,
+    showWikipedia: true,
+    headlessMode: true,
+  };
+  try {
+    if (fs.existsSync(CONFIG_PATH)) {
+      const parsed = JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"));
+      return { ...defaults, ...parsed };
+    }
+  } catch (_) {}
+  return defaults;
+}
+
+function saveConfig(partial) {
+  const merged = { ...loadConfig(), ...partial };
+  fs.mkdirSync(CONFIG_DIR, { recursive: true });
+  fs.writeFileSync(CONFIG_PATH, JSON.stringify(merged, null, 2) + "\n", "utf8");
+  return merged;
+}
+
+const USER_CONFIG = loadConfig();
+const BRIDGE_PORT = Number(USER_CONFIG.bridgePort) || 9229;
+const DEBUG_URL = `http://127.0.0.1:${BRIDGE_PORT}/json/list`;
+const DEFAULT_SPEAKER_PATTERN = (USER_CONFIG.preferredSpeaker || "").toLowerCase();
+
+function detectSpotifyInstall() {
+  const home = os.homedir();
+  if (fs.existsSync("/snap/bin/spotify")) {
+    return {
+      type: "snap",
+      launchCmd: `/snap/bin/spotify`,
+      configDir: path.join(home, "snap", "spotify", "current", ".config", "spotify"),
+      desktopFile: "spotify_spotify.desktop",
+    };
+  }
+  if (fs.existsSync(path.join(home, ".var", "app", "com.spotify.Client"))) {
+    return {
+      type: "flatpak",
+      launchCmd: "flatpak run com.spotify.Client",
+      configDir: path.join(home, ".var", "app", "com.spotify.Client", "config", "spotify"),
+      desktopFile: "com.spotify.Client.desktop",
+    };
+  }
+  return {
+    type: "native",
+    launchCmd: "spotify",
+    configDir: path.join(home, ".config", "spotify"),
+    desktopFile: "spotify.desktop",
+  };
+}
+
+function ensureKeyInPrefsFile(filePath, key, valueLiteral) {
+  fs.mkdirSync(path.dirname(filePath), { recursive: true });
+  let lines = [];
+  if (fs.existsSync(filePath)) {
+    lines = fs.readFileSync(filePath, "utf8").split(/\r?\n/).filter((l) => l.length > 0);
+  }
+  const idx = lines.findIndex((l) => l.startsWith(`${key}=`));
+  const entry = `${key}=${valueLiteral}`;
+  if (idx >= 0) {
+    lines[idx] = entry;
+  } else {
+    lines.push(entry);
+  }
+  fs.writeFileSync(filePath, lines.join("\n") + "\n", "utf8");
+}
+
+function configureSpotifyPrefsAndLauncher() {
+  const info = detectSpotifyInstall();
+  const mainPrefs = path.join(info.configDir, "prefs");
+  ensureKeyInPrefsFile(mainPrefs, "app.enable-developer-mode", "true");
+
+  const usersDir = path.join(info.configDir, "Users");
+  const userAccounts = [];
+  if (fs.existsSync(usersDir)) {
+    for (const d of fs.readdirSync(usersDir)) {
+      const uPrefs = path.join(usersDir, d, "prefs");
+      if (fs.existsSync(path.join(usersDir, d)) && fs.statSync(path.join(usersDir, d)).isDirectory()) {
+        userAccounts.push(d.replace(/-user$/, ""));
+        if (USER_CONFIG.headlessMode !== false) {
+          ensureKeyInPrefsFile(uPrefs, "ui.minimize_to_tray", "true");
+        }
+      }
+    }
+  }
+  return { ...info, userAccounts };
+}
+
+function showOrLaunchSpotifyWindow() {
+  const info = configureSpotifyPrefsAndLauncher();
+  // First try mapping any existing unmapped X11 Spotify window
+  try {
+    execFileSync("python3", [
+      "-c",
+      `import ctypes, subprocess, sys
+out = subprocess.check_output(["xlsclients", "-l"]).decode(errors="ignore")
+win_id = None
+cur = None
+for line in out.splitlines():
+    if line.startswith("Window "):
+        cur = int(line.split()[1].rstrip(":"), 16)
+    elif "Instance/Class:" in line and "spotify" in line.lower() and cur:
+        win_id = cur
+        break
+if not win_id:
+    sys.exit(1)
+X11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+X11.XOpenDisplay.restype = ctypes.c_void_p
+dpy = X11.XOpenDisplay(None)
+X11.XMapRaised(dpy, win_id)
+X11.XFlush(dpy)
+X11.XCloseDisplay(dpy)`,
+    ]);
+    return { ok: true, action: "mapped-existing-window", installType: info.type };
+  } catch (_) {}
+
+  // Otherwise launch Spotify visibly with the remote debugging bridge enabled
+  spawn(
+    "sh",
+    [
+      "-c",
+      `nohup ${info.launchCmd} --remote-debugging-port=${BRIDGE_PORT} --remote-allow-origins=* >/dev/null 2>&1 &`,
+    ],
+    { detached: true, stdio: "ignore" }
+  ).unref();
+  return { ok: true, action: "launched-visible-window", installType: info.type };
+}
+
+async function getPages() {
+  const res = await fetch(DEBUG_URL, { signal: AbortSignal.timeout(1500) });
+  return await res.json();
+}
+
+async function ensureBridge() {
+  try {
+    const pages = await getPages();
+    const xpui = pages.find((p) => p.url && p.url.includes("xpui.app.spotify.com")) || pages[0];
+    if (xpui && xpui.webSocketDebuggerUrl) return xpui.webSocketDebuggerUrl;
+  } catch (_) {
+    // Port 9229 not listening; relaunch Spotify with remote debugging
+  }
+
+  const info = configureSpotifyPrefsAndLauncher();
+  const minFlag = USER_CONFIG.headlessMode !== false ? "--minimized" : "";
+
+  // Relaunch Spotify with --remote-debugging-port and hide its window once ready
+  spawn(
+    "sh",
+    [
+      "-c",
+      `gdbus call --session --dest org.mpris.MediaPlayer2.spotify --object-path /org/mpris/MediaPlayer2 --method org.mpris.MediaPlayer2.Quit >/dev/null 2>&1 || killall spotify >/dev/null 2>&1 || true; sleep 1.2; nohup ${info.launchCmd} ${minFlag} --remote-debugging-port=${BRIDGE_PORT} --remote-allow-origins=* >/dev/null 2>&1 &`,
+    ],
+    { detached: true, stdio: "ignore" }
+  ).unref();
+
+  for (let i = 0; i < 20; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    try {
+      const pages = await getPages();
+      const xpui = pages.find((p) => p.url && p.url.includes("xpui.app.spotify.com")) || pages[0];
+      if (xpui && xpui.webSocketDebuggerUrl) {
+        if (USER_CONFIG.headlessMode !== false) {
+          // Hide the newly spawned Spotify window into background tray mode
+          spawn(
+            "python3",
+            [
+              "-c",
+              `import ctypes, subprocess, time
+time.sleep(0.8)
+out = subprocess.check_output(["xlsclients", "-l"]).decode(errors="ignore")
+win_id = None
+cur = None
+for line in out.splitlines():
+    if line.startswith("Window "):
+        cur = int(line.split()[1].rstrip(":"), 16)
+    elif "Instance/Class:" in line and "spotify" in line.lower() and cur:
+        win_id = cur
+        break
+if win_id:
+    X11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    X11.XOpenDisplay.restype = ctypes.c_void_p
+    dpy = X11.XOpenDisplay(None)
+    X11.XInternAtom.restype = ctypes.c_ulong
+    wm_p = X11.XInternAtom(dpy, b"WM_PROTOCOLS", False)
+    wm_d = X11.XInternAtom(dpy, b"WM_DELETE_WINDOW", False)
+    class Ev(ctypes.Structure):
+        _fields_ = [("type", ctypes.c_int), ("serial", ctypes.c_ulong), ("send_event", ctypes.c_int), ("display", ctypes.c_void_p), ("window", ctypes.c_ulong), ("message_type", ctypes.c_ulong), ("format", ctypes.c_int), ("data", ctypes.c_ulong * 5)]
+    e = Ev(33, 0, 1, dpy, win_id, wm_p, 32, (wm_d, 0, 0, 0, 0))
+    X11.XSendEvent(dpy, win_id, False, 0, ctypes.byref(e))
+    X11.XFlush(dpy)
+    X11.XCloseDisplay(dpy)`,
+            ],
+            { detached: true, stdio: "ignore" }
+          ).unref();
+        }
+        return xpui.webSocketDebuggerUrl;
+      }
+    } catch (_) {}
+  }
+  throw new Error(`Spotify CEF bridge on 127.0.0.1:${BRIDGE_PORT} not reachable`);
+}
+
+function evalInSpotify(wsUrl, expression) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error("Timed out talking to Spotify CEF bridge"));
+    }, 5000);
+    const ws = new WebSocket(wsUrl);
+    ws.onopen = () => {
+      ws.send(
+        JSON.stringify({
+          id: 1,
+          method: "Runtime.evaluate",
+          params: {
+            expression,
+            awaitPromise: true,
+            returnByValue: true,
+          },
+        })
+      );
+    };
+    ws.onerror = (err) => {
+      clearTimeout(timer);
+      reject(err);
+    };
+    ws.onmessage = (event) => {
+      const msg = JSON.parse(event.data);
+      if (msg.id === 1) {
+        clearTimeout(timer);
+        ws.close();
+        if (msg.result?.exceptionDetails) {
+          reject(new Error(msg.result.exceptionDetails.text || "JS exception in Spotify"));
+        } else {
+          resolve(msg.result?.result?.value);
+        }
+      }
+    };
+  });
+}
+
+function buildSpotifyExpression(cmd, arg) {
+  return `(async () => {
+    function findPlatform() {
+      const candidates = [
+        document.querySelector('button[aria-label="Connect to a device"]'),
+        document.querySelector('[data-testid="now-playing-bar"]'),
+        document.querySelector('#main'),
+        document.body.firstElementChild,
+      ].filter(Boolean);
+      for (const el of candidates) {
+        const fKey = Object.keys(el).find(k => k.startsWith('__reactFiber$'));
+        if (!fKey) continue;
+        let curr = el[fKey];
+        while (curr) {
+          if (curr.memoizedProps?.platform) return curr.memoizedProps.platform;
+          if (curr.memoizedProps?.value?.getRegistry) return curr.memoizedProps.value;
+          curr = curr.return;
+        }
+      }
+      return null;
+    }
+
+    const platform = findPlatform();
+    if (!platform) throw new Error('Spotify Platform registry not found');
+    const reg = platform.getRegistry();
+    let connectApi = null;
+    let devicesApi = null;
+    let playbackApi = null;
+    let playerApi = null;
+    let playlistApi = null;
+    let gqlLoader = null;
+    let reqBuilder = null;
+    for (const [k] of reg._map.entries()) {
+      const name = k?.description || k?.toString() || String(k);
+      if (name === 'ConnectAPI') connectApi = reg.resolve(k);
+      if (name === 'ConnectDevicesAPI') devicesApi = reg.resolve(k);
+      if (name === 'PlaybackAPI') playbackApi = reg.resolve(k);
+      if (name === 'PlayerAPI') playerApi = reg.resolve(k);
+      if (name === 'PlaylistAPI') playlistApi = reg.resolve(k);
+      if (name === 'GraphQLLoader') gqlLoader = reg.resolve(k);
+      if (name === 'RequestBuilder') reqBuilder = reg.resolve(k);
+      if (name === 'SettingsAPI') {
+        try { reg.resolve(k)?.startupBehaviour?.closeToTray?.setValue?.(true); } catch (_) {}
+      }
+    }
+    if (!connectApi || !devicesApi) throw new Error('ConnectAPI not found in registry');
+
+    const mapDev = (d) => d ? ({
+      id: d.id,
+      connectStateId: d.connectStateId,
+      name: d.name,
+      type: d.type,
+      isActive: !!d.isActive,
+      isLocal: !!d.isLocal,
+      isConnecting: !!d.isConnecting,
+      volume: d.volume,
+    }) : null;
+
+    const cmd = ${JSON.stringify(cmd)};
+    const arg = ${JSON.stringify(arg || "")};
+
+    if (cmd === 'discover') {
+      try { await connectApi.initiateLocalDiscovery?.(); } catch (_) {}
+      try { await connectApi.updateListOfDevices?.(); } catch (_) {}
+    }
+
+    if (cmd === 'volume') {
+      const v = Math.max(0, Math.min(1, parseFloat(arg)));
+      if (!Number.isNaN(v) && playbackApi?.setVolume) {
+        await playbackApi.setVolume(v);
+      }
+    }
+
+    if (cmd === 'search') {
+      const q = (arg || '').trim();
+      if (!q || !gqlLoader) return { tracks: [], albums: [] };
+      const vars = {
+        searchTerm: q,
+        limit: 30,
+        offset: 0,
+        numberOfTopResults: 5,
+        includeAudiobooks: false,
+        includeAuthors: false,
+        includePreReleases: false,
+      };
+      const [trackRes, albumRes] = await Promise.all([
+        gqlLoader(
+          {
+            name: 'searchTracks',
+            operation: 'query',
+            sha256Hash: '59ee4a659c32e9ad894a71308207594a65ba67bb6b632b183abe97303a51fa55',
+            value: null,
+          },
+          vars
+        ).catch(() => null),
+        gqlLoader(
+          {
+            name: 'searchAlbums',
+            operation: 'query',
+            sha256Hash: '64ae1fe6df380b038c0a65a2606d3361bc270de6870b2fdc99cf0848b1efa6d3',
+            value: null,
+          },
+          vars
+        ).catch(() => null),
+      ]);
+      const rawTracks = trackRes?.data?.searchV2?.tracksV2?.items || [];
+      const tracks = [];
+      for (const wrapper of rawTracks) {
+        const d = wrapper?.item?.data;
+        if (!d || !d.uri || !d.name) continue;
+        const artists = (d.artists?.items || [])
+          .map(a => a?.profile?.name)
+          .filter(Boolean)
+          .join(', ');
+        tracks.push({
+          uri: d.uri,
+          name: d.name,
+          artist: artists,
+          album: d.albumOfTrack?.name || '',
+          durationMs: d.duration?.totalMilliseconds || 0,
+        });
+        if (tracks.length >= 25) break;
+      }
+
+      const rawAlbums = albumRes?.data?.searchV2?.albumsV2?.items || [];
+      const albums = [];
+      for (const wrapper of rawAlbums) {
+        const d = wrapper?.data;
+        if (!d || !d.uri || !d.name) continue;
+        const artists = (d.artists?.items || [])
+          .map(a => a?.profile?.name)
+          .filter(Boolean)
+          .join(', ');
+        albums.push({
+          uri: d.uri,
+          name: d.name,
+          artist: artists,
+          year: d.date?.year || '',
+        });
+        if (albums.length >= 15) break;
+      }
+
+      return { query: q, tracks, albums };
+    }
+
+    if (cmd === 'artist-albums') {
+      const st = playerApi?.getState?.();
+      let artistName = (arg || '').trim() || st?.item?.artists?.[0]?.name || st?.item?.metadata?.artist_name || '';
+      let artistUri = st?.item?.artists?.[0]?.uri || st?.item?.metadata?.artist_uri || '';
+
+      if (!gqlLoader) return { artist: artistName, albums: [] };
+
+      const albums = [];
+      const seenUris = new Set();
+
+      // 1. If we have the artist URI from the currently playing track (and artistName matches or wasn't overridden), fetch full discography
+      if (artistUri && (!arg || artistName.toLowerCase() === (st?.item?.artists?.[0]?.name || '').toLowerCase())) {
+        try {
+          const discoRes = await gqlLoader(
+            {
+              name: 'queryArtistDiscographyAlbums',
+              operation: 'query',
+              sha256Hash: '5e07d323febb57b4a56a42abbf781490e58764aa45feb6e3dc0591564fc56599',
+              value: null,
+            },
+            {
+              uri: artistUri,
+              offset: 0,
+              limit: 50,
+              order: 'DATE_DESC',
+            }
+          );
+          const groups = discoRes?.data?.artistUnion?.discography?.albums?.items || [];
+          for (const g of groups) {
+            for (const rel of (g?.releases?.items || [])) {
+              if (!rel?.uri || !rel?.name || seenUris.has(rel.uri)) continue;
+              seenUris.add(rel.uri);
+              albums.push({
+                uri: rel.uri,
+                name: rel.name,
+                artist: artistName,
+                year: rel.date?.year || '',
+                trackCount: rel.tracks?.totalCount || 0,
+                albumType: rel.type || 'ALBUM',
+              });
+            }
+          }
+        } catch (_) {}
+      }
+
+      // 2. Also query searchAlbums (limit 50) if discography was empty or to supplement compilations
+      if (albums.length === 0 && artistName) {
+        const res = await gqlLoader(
+          {
+            name: 'searchAlbums',
+            operation: 'query',
+            sha256Hash: '64ae1fe6df380b038c0a65a2606d3361bc270de6870b2fdc99cf0848b1efa6d3',
+            value: null,
+          },
+          {
+            searchTerm: artistName,
+            limit: 50,
+            offset: 0,
+            numberOfTopResults: 5,
+            includeAudiobooks: false,
+            includeAuthors: false,
+            includePreReleases: false,
+          }
+        );
+        const rawItems = res?.data?.searchV2?.albumsV2?.items || [];
+        const targetLower = artistName.toLowerCase();
+        const exact = [];
+        const other = [];
+        for (const wrapper of rawItems) {
+          const d = wrapper?.data;
+          if (!d || !d.uri || !d.name || seenUris.has(d.uri)) continue;
+          seenUris.add(d.uri);
+          const artistsList = (d.artists?.items || [])
+            .map(a => a?.profile?.name)
+            .filter(Boolean);
+          const artistsStr = artistsList.join(', ');
+          const entry = {
+            uri: d.uri,
+            name: d.name,
+            artist: artistsStr || artistName,
+            year: d.date?.year || '',
+            albumType: d.type || 'ALBUM',
+          };
+          if (artistsList.some(a => a.toLowerCase() === targetLower || a.toLowerCase().includes(targetLower))) {
+            exact.push(entry);
+          } else {
+            other.push(entry);
+          }
+        }
+        albums.push(...exact, ...other);
+      }
+
+      return { artist: artistName, albums };
+    }
+
+    if (cmd === 'current-album-tracks' || cmd === 'album-tracks') {
+      const st = playerApi?.getState?.();
+      let albumUri = (arg || '').trim();
+      if (!albumUri || cmd === 'current-album-tracks') {
+        albumUri = albumUri || st?.item?.metadata?.album_uri || '';
+      }
+      if (!albumUri || !gqlLoader) return { albumUri, tracks: [] };
+      const res = await gqlLoader(
+        {
+          name: 'getAlbum',
+          operation: 'query',
+          sha256Hash: 'b9bfabef66ed756e5e13f68a942deb60bd4125ec1f1be8cc42769dc0259b4b10',
+          value: null,
+        },
+        {
+          uri: albumUri,
+          locale: '',
+          offset: 0,
+          limit: 100,
+        }
+      );
+      const album = res?.data?.albumUnion;
+      const albumName = album?.name || st?.item?.metadata?.album_title || '';
+      const rawItems = album?.tracksV2?.items || [];
+      const tracks = [];
+      for (let i = 0; i < rawItems.length; i++) {
+        const item = rawItems[i];
+        const t = item?.track;
+        if (!t || !t.uri || !t.name) continue;
+        const artists = (t.artists?.items || [])
+          .map(a => a?.profile?.name)
+          .filter(Boolean)
+          .join(', ');
+        tracks.push({
+          uri: t.uri,
+          uid: item.uid || '',
+          index: i,
+          trackNumber: t.trackNumber || (i + 1),
+          name: t.name,
+          artist: artists,
+          durationMs: t.duration?.totalMilliseconds || 0,
+        });
+      }
+      return {
+        albumUri,
+        albumName,
+        tracks,
+      };
+    }
+
+    if (cmd === 'play-album') {
+      const parts = (arg || '').trim().split('|');
+      const albumUri = parts[0] || '';
+      const trackUri = parts[1] || '';
+      const trackIndex = parts[2] !== undefined && parts[2] !== '' ? Number(parts[2]) : 0;
+      const trackUid = parts[3] || '';
+      if (!albumUri || !playerApi) throw new Error('Missing albumUri or PlayerAPI');
+      const skipTo = trackUri
+        ? { uri: trackUri, ...(trackUid ? { uid: trackUid } : {}), index: trackIndex }
+        : { index: 0 };
+      await playerApi.play(
+        { uri: albumUri },
+        { featureIdentifier: 'album' },
+        { skipTo, shuffle: false }
+      );
+      return {
+        ok: true,
+        albumUri,
+        trackUri: trackUri || null,
+      };
+    }
+
+    if (cmd === 'play-radio') {
+      const trackUri = (arg || '').trim();
+      if (!trackUri || !playerApi) throw new Error('Missing trackUri or PlayerAPI');
+      let playlistUri = null;
+      let seedItem = null;
+      let upNext = [];
+      if (reqBuilder) {
+        try {
+          const seedRes = await reqBuilder
+            .build()
+            .withHost('https://spclient.wg.spotify.com/inspiredby-mix/v2')
+            .withPath('/seed_to_playlist/' + trackUri)
+            .withQueryParameters({ 'response-format': 'json' })
+            .withoutMarket()
+            .withEndpointIdentifier('/seed_to_playlist/{uri}')
+            .send();
+          playlistUri = seedRes?.body?.mediaItems?.[0]?.uri || null;
+        } catch (_) {}
+      }
+      if (playlistUri && playlistApi?.getContents) {
+        try {
+          const contents = await playlistApi.getContents(playlistUri, { limit: 6 });
+          const items = contents?.items || [];
+          const idx = items.findIndex(i => i.uri === trackUri);
+          if (idx !== -1) {
+            seedItem = { uri: items[idx].uri, uid: items[idx].uid, index: idx };
+          } else if (items[0]) {
+            seedItem = { uri: items[0].uri, uid: items[0].uid, index: 0 };
+          }
+          upNext = items.slice(1, 4).map(i => i.name).filter(Boolean);
+        } catch (_) {}
+      }
+      if (playlistUri) {
+        await playerApi.play(
+          { uri: playlistUri },
+          { featureIdentifier: 'radio' },
+          {
+            skipTo: seedItem || { uri: trackUri, index: 0 },
+            shuffle: false,
+          }
+        );
+      } else {
+        await playerApi.play(
+          { uri: trackUri },
+          { featureIdentifier: 'search' },
+          {}
+        );
+      }
+      return {
+        ok: true,
+        trackUri,
+        playlistUri,
+        upNext,
+      };
+    }
+
+    let devices = (devicesApi.getDevices() || []).map(mapDev);
+    let active = mapDev(devicesApi.getActiveDevice()) || devices.find(d => d.isActive) || null;
+
+    if (cmd === 'toggle' || cmd === 'select') {
+      const pattern = (arg || ${JSON.stringify(DEFAULT_SPEAKER_PATTERN)}).toLowerCase();
+      let target = null;
+      const matchDevice = (list, pat) => {
+        if (pat) {
+          return list.find(d => d.name.toLowerCase().includes(pat) || d.id.toLowerCase().includes(pat));
+        }
+        return list.find(d => !d.isLocal);
+      };
+      if (cmd === 'toggle') {
+        if (active && !active.isLocal && (!pattern || active.name.toLowerCase().includes(pattern))) {
+          target = devices.find(d => d.isLocal) || { id: 'local_device', name: 'desktop', isLocal: true };
+        } else {
+          target = matchDevice(devices, pattern);
+          if (!target) {
+            try { await connectApi.initiateLocalDiscovery?.(); } catch (_) {}
+            try { await connectApi.updateListOfDevices?.(); } catch (_) {}
+            await new Promise(r => setTimeout(r, 400));
+            devices = (devicesApi.getDevices() || []).map(mapDev);
+            target = matchDevice(devices, pattern);
+          }
+          if (!target && active && !active.isLocal) {
+            target = devices.find(d => d.isLocal) || { id: 'local_device', name: 'desktop', isLocal: true };
+          }
+        }
+      } else {
+        if (pattern === 'local' || pattern === 'local_device' || pattern === 'desktop' || pattern === 'pc') {
+          target = devices.find(d => d.isLocal) || { id: 'local_device', name: 'desktop', isLocal: true };
+        } else {
+          target = devices.find(d => d.id === arg || d.connectStateId === arg || d.name.toLowerCase().includes(pattern));
+        }
+      }
+
+      if (!target) {
+        throw new Error('Target device not found: ' + (arg || ${JSON.stringify(DEFAULT_SPEAKER_PATTERN)} || 'any external speaker'));
+      }
+
+      await connectApi.transferPlayback(target.id, { interactionId: "" });
+      for (let i = 0; i < 12; i++) {
+        await new Promise(r => setTimeout(r, 200));
+        devices = (devicesApi.getDevices() || []).map(mapDev);
+        active = mapDev(devicesApi.getActiveDevice()) || devices.find(d => d.isActive) || null;
+        if (active && (active.id === target.id || (target.isLocal && active.isLocal))) break;
+      }
+    }
+
+    return {
+      active,
+      devices,
+      preferredSpeaker: ${JSON.stringify(USER_CONFIG.preferredSpeaker || "")},
+      showWikipedia: ${JSON.stringify(USER_CONFIG.showWikipedia !== false)},
+    };
+  })()`;
+}
+
+function normTitle(s) {
+  return (s || '')
+    .toLowerCase()
+    .replace(/['’`]/g, "'")
+    .replace(/&/g, 'and')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function cleanAlbumTitle(raw) {
+  return (raw || '')
+    .replace(/\s*\([^)]*(remaster|deluxe|expanded|anniversary|edition|mix|version|live|bonus|disc)[^)]*\)/gi, '')
+    .replace(/\s*\[[^\]]*(remaster|deluxe|expanded|anniversary|edition|mix|version|live|bonus|disc)[^\]]*\]/gi, '')
+    .replace(/\s*-\s*\d{4}\s*(remaster|mix|version).*$/i, '')
+    .trim();
+}
+
+async function resolveArtistWiki(artistName) {
+  const clean = (artistName || '').trim();
+  if (!clean) return null;
+  try {
+    const q = `${clean}`;
+    const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(q)}&srlimit=10&utf8=1&format=json`;
+    const r = await fetch(url, { headers: { 'User-Agent': 'SpotifyGnomeTopBar/1.0 (Linux)' } });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const hits = data?.query?.search || [];
+    const targetNorm = normTitle(clean);
+    const musicRe = /\b(band|musician|singer|songwriter|rock|pop|jazz|metal|prog|progressive|rapper|hip hop|composer|orchestra|guitarist|vocalist|drummer|bassist|keyboardist|pianist|duo|trio|quartet|group|album|discography|musical|record|artist|dj|electronic|folk|blues|punk|indie|country|soul)\b/i;
+
+    for (const h of hits) {
+      const title = h.title || '';
+      const baseTitle = title.replace(/\s*\([^)]*\)\s*$/, '');
+      const parenMatch = title.match(/\(([^)]+)\)$/);
+      const paren = parenMatch ? parenMatch[1].toLowerCase() : '';
+      if (normTitle(baseTitle) !== targetNorm) continue;
+      if (paren && /\b(band|musician|singer|group|rapper|composer|dj|duo|trio|orchestra|artist|musical group)\b/i.test(paren)) {
+        return `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+      }
+      if (!paren && musicRe.test(h.snippet || '')) {
+        return `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+      }
+    }
+    return null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function resolveAlbumWiki(albumName, artistName) {
+  const rawAlbum = (albumName || '').trim();
+  if (!rawAlbum) return null;
+  const cleanAlbum = cleanAlbumTitle(rawAlbum) || rawAlbum;
+  const cleanArtist = (artistName || '').trim();
+  try {
+    const query = cleanArtist ? `"${cleanAlbum}" "${cleanArtist}" album` : `"${cleanAlbum}" album`;
+    const url = `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(query)}&srlimit=10&utf8=1&format=json`;
+    const r = await fetch(url, { headers: { 'User-Agent': 'SpotifyGnomeTopBar/1.0 (Linux)' } });
+    if (!r.ok) return null;
+    const data = await r.json();
+    const hits = data?.query?.search || [];
+    const targetNorm = normTitle(cleanAlbum);
+    const rawNorm = normTitle(rawAlbum);
+    const artistNorm = normTitle(cleanArtist);
+    const albumRe = /\b(album|studio|live|compilation|ep|extended play|soundtrack|box set|release|recorded|track|band|single)\b/i;
+
+    let fallbackBoxOrSong = null;
+    for (const h of hits) {
+      const title = h.title || '';
+      const baseTitle = title.replace(/\s*\([^)]*\)\s*$/, '');
+      const baseNorm = normTitle(baseTitle);
+      const parenMatch = title.match(/\(([^)]+)\)$/);
+      const paren = parenMatch ? parenMatch[1].toLowerCase() : '';
+      if (baseNorm !== targetNorm && baseNorm !== rawNorm) continue;
+      const snip = h.snippet || '';
+      if (!paren && albumRe.test(snip) && (!artistNorm || normTitle(snip).includes(artistNorm))) {
+        return `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+      }
+      if (paren && /\b(album|ep|soundtrack)\b/i.test(paren) && !/\b(box set|song|single)\b/i.test(paren)) {
+        return `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+      }
+      if (!fallbackBoxOrSong && paren && /\b(box set|song|single)\b/i.test(paren)) {
+        fallbackBoxOrSong = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, '_'))}`;
+      }
+    }
+    return fallbackBoxOrSong;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function main() {
+  const cmd = process.argv[2] || "status";
+  const arg = process.argv.slice(3).join(" ");
+
+  if (cmd === "get-config") {
+    const info = configureSpotifyPrefsAndLauncher();
+    let bridgeConnected = false;
+    try {
+      const pages = await getPages();
+      bridgeConnected = Array.isArray(pages) && pages.length > 0;
+    } catch (_) {}
+    console.log(
+      JSON.stringify(
+        {
+          config: loadConfig(),
+          installType: info.type,
+          configDir: info.configDir,
+          userAccounts: info.userAccounts,
+          loggedIn: info.userAccounts.length > 0,
+          bridgeConnected,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  if (cmd === "set-config") {
+    const partial = JSON.parse(arg || "{}");
+    const saved = saveConfig(partial);
+    configureSpotifyPrefsAndLauncher();
+    console.log(JSON.stringify({ ok: true, config: saved }, null, 2));
+    return;
+  }
+
+  if (cmd === "setup-bridge") {
+    const info = configureSpotifyPrefsAndLauncher();
+    const wsUrl = await ensureBridge();
+    console.log(
+      JSON.stringify(
+        {
+          ok: true,
+          installType: info.type,
+          userAccounts: info.userAccounts,
+          loggedIn: info.userAccounts.length > 0,
+          wsUrl,
+        },
+        null,
+        2
+      )
+    );
+    return;
+  }
+
+  if (cmd === "show-window" || cmd === "open-login") {
+    const res = showOrLaunchSpotifyWindow();
+    console.log(JSON.stringify(res, null, 2));
+    return;
+  }
+
+  if (cmd === 'wiki-lookup') {
+    if (USER_CONFIG.showWikipedia === false) {
+      console.log(JSON.stringify({ artistWikiUrl: null, albumWikiUrl: null }));
+      return;
+    }
+    const parts = (arg || '').split('|');
+    const artistName = (parts[0] || '').trim();
+    const albumName = (parts[1] || '').trim();
+    const [artistWikiUrl, albumWikiUrl] = await Promise.all([
+      resolveArtistWiki(artistName),
+      resolveAlbumWiki(albumName, artistName),
+    ]);
+    console.log(JSON.stringify({
+      artist: artistName,
+      album: albumName,
+      artistWikiUrl,
+      albumWikiUrl,
+    }, null, 2));
+    return;
+  }
+  const wsUrl = await ensureBridge();
+  const result = await evalInSpotify(wsUrl, buildSpotifyExpression(cmd, arg));
+  process.stdout.write(JSON.stringify(result) + "\n");
+}
+
+main().catch((err) => {
+  process.stderr.write(JSON.stringify({ error: err.message || String(err) }) + "\n");
+  process.exit(1);
+});
